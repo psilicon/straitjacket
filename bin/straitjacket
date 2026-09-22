@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#
+# straitjacket — run Claude Code / Codex inside a disposable container, against any host directory.
+#
+# One image (`straitjacket`), one container per target directory, plain docker underneath.
+# Nothing has to be copied into your projects.
+#
+#   straitjacket up ~/repos       build + start a container for ~/repos
+#   straitjacket shell ~/repos    shell inside it, already cd'd to the mount
+#   straitjacket codex ~/repos    launch codex directly
+#
+# DIR defaults to the current directory, so the common case is just:
+#   cd ~/repos && straitjacket up && straitjacket shell
+#
+set -euo pipefail
+
+# Resolve through symlinks (this is usually linked into /usr/local/bin), without relying on
+# GNU readlink -f, which macOS does not have.
+_sj_src="${BASH_SOURCE[0]}"
+while [ -L "$_sj_src" ]; do
+  _sj_dir="$(cd -P "$(dirname "$_sj_src")" && pwd)"
+  _sj_src="$(readlink "$_sj_src")"
+  case "$_sj_src" in /*) ;; *) _sj_src="$_sj_dir/$_sj_src" ;; esac
+done
+SJ_ROOT="${STRAITJACKET_HOME:-$(cd -P "$(dirname "$_sj_src")/.." && pwd)}"
+
+IMAGE="straitjacket"                 # built from $SJ_ROOT/Dockerfile
+LABEL="straitjacket.workspace"       # =DIR on every container; how a container is found again
+
+# Names the volume set holding Claude/Codex logins and the token file. One profile = one login,
+# shared by every target directory. Override to isolate a project's credentials.
+export STRAITJACKET_PROFILE="${STRAITJACKET_PROFILE:-default}"
+
+die() { echo "straitjacket: $*" >&2; exit 1; }
+
+usage() {
+  sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+Commands:
+  up [DIR] [-- ARGS...]   Build the image if missing, then create/start the container for DIR
+                          (extra ARGS go to `docker run`, e.g. -- --mount type=bind,source=/data,target=/data)
+  rebuild [DIR]           Rebuild the image and recreate the container
+  shell [DIR]             Interactive login shell in the container
+  exec [DIR] -- CMD...    Run CMD in the container
+  claude [DIR]            Launch Claude Code
+  codex [DIR]             Launch Codex
+  init [DIR]              Run the one-time token / git identity / Codex login setup
+  down [DIR]              Stop and remove the container (image, volumes and logins survive)
+  list                    List straitjacket containers and the directories they serve
+
+Environment:
+  STRAITJACKET_PROFILE    Volume set to use (default: "default")
+USAGE
+}
+
+# Absolute, normalised path — the label value, so it must be stable across invocations.
+resolve_dir() {
+  local d="${1:-$PWD}"
+  [ -d "$d" ] || die "no such directory: $d"
+  (cd "$d" && pwd -P)
+}
+
+# After a subcommand name: an argument that isn't `--` is the target directory.
+take_dir() {
+  if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then echo "$1"; else echo ""; fi
+}
+
+workspace()    { echo "/workspaces/$(basename "$1")"; }     # mount point inside the container
+container_id() { docker ps -aq --filter "label=$LABEL=$1"; } # by label — the source of truth
+
+short_hash() {
+  if command -v shasum >/dev/null; then printf '%s' "$1" | shasum -a 256 | cut -c1-6
+  else printf '%s' "$1" | sha256sum | cut -c1-6; fi
+}
+
+# Container names are cosmetic (lookup is by label) but they're what `docker ps` shows, so:
+# straitjacket-<basename>, falling back to straitjacket-<basename>-<hash> only when another
+# container — a different directory with the same basename, say — already holds that name.
+container_name() {
+  local dir="$1" name owner
+  name="straitjacket-$(basename "$dir" | sed 's/[^A-Za-z0-9_.-]/_/g')"
+  if owner="$(docker inspect -f "{{index .Config.Labels \"$LABEL\"}}" "$name" 2>/dev/null)" \
+     && [ "$owner" != "$dir" ]; then
+    name="$name-$(short_hash "$dir")"
+  fi
+  echo "$name"
+}
+
+image_exists() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
+
+build_image() {
+  local args=()
+  # Match the host user's ids on Linux so bind-mounted files come out owned by the user.
+  # macOS translates ownership at the mount, so the image defaults (1000:1000) are fine there.
+  if [ "$(uname -s)" = "Linux" ]; then
+    args+=(--build-arg "USER_UID=$(id -u)" --build-arg "USER_GID=$(id -g)")
+  fi
+  docker build -t "$IMAGE" ${args[@]+"${args[@]}"} "$SJ_ROOT"
+}
+
+create_container() {  # create_container DIR [DOCKER_RUN_ARGS...]
+  local dir="$1" ws p="$STRAITJACKET_PROFILE" cid; shift
+  ws="$(workspace "$dir")"
+  # PVC-style named volumes — logins/config persist across rebuilds, nothing from the host:
+  #   ~/.claude-config       Claude Code config + login (CLAUDE_CONFIG_DIR points here)
+  #   ~/.codex               Codex config + login
+  #   ~/.config/straitjacket env file of raw tokens (GH_TOKEN, git identity, future ones)
+  cid="$(docker run -d --init \
+    --name "$(container_name "$dir")" \
+    --label "$LABEL=$dir" \
+    --label "straitjacket.profile=$p" \
+    --mount "type=bind,source=$dir,target=$ws" \
+    --mount "type=volume,source=straitjacket-$p-claude,target=/home/node/.claude-config" \
+    --mount "type=volume,source=straitjacket-$p-codex,target=/home/node/.codex" \
+    --mount "type=volume,source=straitjacket-$p-secrets,target=/home/node/.config/straitjacket" \
+    --workdir "$ws" \
+    "$@" \
+    "$IMAGE" sleep infinity)"
+  # Runs once per container, as `node` (with sudo), cwd = the mount. Baked into the image.
+  docker exec --workdir "$ws" "$cid" straitjacket-postcreate
+}
+
+# docker exec into DIR's container as `node`, cwd = the mount, with a TTY when we have one and
+# the host's terminal identification passed through so terminal-integration features work.
+dc_exec() {           # dc_exec DIR CMD...
+  local dir="$1" cid flags=(-i -e TERM=xterm-256color) v; shift
+  cid="$(container_id "$dir")"
+  [ -n "$cid" ] || die "no container for $dir — run: straitjacket up $dir"
+  [ -t 0 ] && [ -t 1 ] && flags+=(-t)
+  for v in COLORTERM TERM_PROGRAM LC_TERMINAL LC_TERMINAL_VERSION; do
+    [ -n "${!v:-}" ] && flags+=(-e "$v=${!v}")
+  done
+  docker exec "${flags[@]}" --user node --workdir "$(workspace "$dir")" "$cid" "$@"
+}
+
+# Run a command through a login shell, so the token env file is sourced and the user's own
+# flags are never seen by docker's option parser.
+sh_exec() {           # sh_exec DIR CMD...
+  local dir="$1"; shift
+  dc_exec "$dir" bash -lc "$(printf '%q ' "$@")"
+}
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  up|rebuild|shell|exec|claude|codex|init|down|list)
+    command -v docker >/dev/null || die "docker not found"
+    ;;
+  *) die "unknown command '$cmd' (try --help)" ;;
+esac
+
+case "$cmd" in
+  up|rebuild)
+    dir="$(take_dir "$@")"; [ -n "$dir" ] && shift || true
+    dir="$(resolve_dir "$dir")"
+    [ "${1:-}" = "--" ] && shift || true
+    [ -f "$SJ_ROOT/Dockerfile" ] || die "Dockerfile not found at $SJ_ROOT"
+    if [ "$cmd" = "rebuild" ] || ! image_exists; then build_image; fi
+    cid="$(container_id "$dir")"
+    if [ "$cmd" = "rebuild" ] && [ -n "$cid" ]; then
+      # shellcheck disable=SC2086
+      docker rm -f $cid >/dev/null; cid=""
+    fi
+    if [ -z "$cid" ]; then
+      create_container "$dir" "$@"
+    else
+      [ "$#" -eq 0 ] || echo "straitjacket: container already exists; extra docker args ignored (use rebuild)" >&2
+      docker start "$cid" >/dev/null
+    fi
+    echo
+    echo "Workspace: $dir  →  $(workspace "$dir")   (container: $(docker inspect -f '{{.Name}}' "$(container_id "$dir")" | sed 's|^/||'), profile: $STRAITJACKET_PROFILE)"
+    echo "Next: straitjacket shell $dir"
+    ;;
+
+  shell)
+    dir="$(resolve_dir "$(take_dir "$@")")"
+    dc_exec "$dir" bash -l
+    ;;
+
+  exec)
+    dir="$(take_dir "$@")"; [ -n "$dir" ] && shift || true
+    dir="$(resolve_dir "$dir")"
+    [ "${1:-}" = "--" ] && shift || true
+    [ "$#" -gt 0 ] || die "exec needs a command: straitjacket exec [DIR] -- CMD..."
+    sh_exec "$dir" "$@"
+    ;;
+
+  claude|codex)
+    dir="$(resolve_dir "$(take_dir "$@")")"
+    dc_exec "$dir" bash -lc "$cmd"
+    ;;
+
+  init)
+    dir="$(resolve_dir "$(take_dir "$@")")"
+    # Sourced so the tokens land in the shell that survives the call; `source` finds it on PATH.
+    dc_exec "$dir" bash -lc 'source straitjacket-init'
+    ;;
+
+  down)
+    dir="$(resolve_dir "$(take_dir "$@")")"
+    ids="$(container_id "$dir")"
+    [ -n "$ids" ] || die "no container found for $dir"
+    # shellcheck disable=SC2086
+    docker rm -f $ids >/dev/null
+    echo "Removed. Image and volumes (logins, tokens) are untouched."
+    ;;
+
+  list)
+    docker ps -a \
+      --filter "label=$LABEL" \
+      --format "table {{.Names}}\t{{.Status}}\t{{.Label \"straitjacket.profile\"}}\t{{.Label \"$LABEL\"}}"
+    ;;
+esac
