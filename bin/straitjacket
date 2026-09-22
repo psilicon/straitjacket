@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# straitjacket — run Claude Code / Codex inside a disposable container, against any host directory.
+# straitjacket — run Claude Code, Codex, or Grok Build inside a disposable container, against any host directory.
 #
 # One image (`straitjacket`), one container per target directory, plain docker underneath.
 # Nothing has to be copied into your projects.
 #
 #   straitjacket up ~/repos       build + start a container for ~/repos
 #   straitjacket shell ~/repos    shell inside it, already cd'd to the mount
-#   straitjacket codex ~/repos    launch codex directly
+#   straitjacket {claude|codex|grok} ~/repos    launch that agent directly
 #
 # DIR defaults to the current directory, so the common case is just:
 #   cd ~/repos && straitjacket up && straitjacket shell
@@ -27,7 +27,7 @@ SJ_ROOT="${STRAITJACKET_HOME:-$(cd -P "$(dirname "$_sj_src")/.." && pwd)}"
 IMAGE="straitjacket"                 # built from $SJ_ROOT/Dockerfile
 LABEL="straitjacket.workspace"       # =DIR on every container; how a container is found again
 
-# Names the volume set holding Claude/Codex logins and the token file. One profile = one login,
+# Names the volume set holding Claude/Codex/Grok logins and the token file. One profile = one login,
 # shared by every target directory. Override to isolate a project's credentials.
 export STRAITJACKET_PROFILE="${STRAITJACKET_PROFILE:-default}"
 
@@ -44,6 +44,7 @@ Commands:
   exec [DIR] -- CMD...    Run CMD in the container
   claude [DIR] [-- ARGS...] Launch Claude Code with optional agent arguments
   codex [DIR] [-- ARGS...] Launch Codex with optional agent arguments
+  grok [DIR] [-- ARGS...]  Launch Grok Build with optional agent arguments
   init [DIR]              Run the one-time token / git identity / Codex login setup
   down [DIR]              Stop and remove the container (image, volumes and logins survive)
   list                    List straitjacket containers and the directories they serve
@@ -151,6 +152,7 @@ create_container() {  # create_container DIR [DOCKER_RUN_ARGS...]
   # PVC-style named volumes — logins/config persist across rebuilds, nothing from the host:
   #   ~/.claude-config       Claude Code config + login (CLAUDE_CONFIG_DIR points here)
   #   ~/.codex               Codex config + login
+  #   ~/.grok                Grok Build config + login + sessions
   #   ~/.config/straitjacket env file of raw tokens (GH_TOKEN, git identity, future ones)
   cid="$(docker run -d --init \
     --name "$(container_name "$dir")" \
@@ -160,6 +162,7 @@ create_container() {  # create_container DIR [DOCKER_RUN_ARGS...]
     --mount "type=bind,source=$dir,target=$ws" \
     --mount "type=volume,source=straitjacket-$p-claude,target=/home/node/.claude-config" \
     --mount "type=volume,source=straitjacket-$p-codex,target=/home/node/.codex" \
+    --mount "type=volume,source=straitjacket-$p-grok,target=/home/node/.grok" \
     --mount "type=volume,source=straitjacket-$p-secrets,target=/home/node/.config/straitjacket" \
     --workdir "$ws" \
     "$@" \
@@ -199,7 +202,7 @@ cmd="${1:-}"; shift || true
 
 case "$cmd" in
   ""|-h|--help|help) usage; exit 0 ;;
-  up|rebuild|shell|exec|claude|codex|init|down|list)
+  up|rebuild|shell|exec|claude|codex|grok|init|down|list)
     command -v docker >/dev/null || die "docker not found"
     ;;
   *) die "unknown command '$cmd' (try --help)" ;;
@@ -244,7 +247,7 @@ case "$cmd" in
     sh_exec "$dir" "$@"
     ;;
 
-  claude|codex)
+  claude|codex|grok)
     dir="$(take_dir "$@")"; [ -n "$dir" ] && shift || true
     dir="$(resolve_dir "$dir")"
     if [ "$#" -gt 0 ]; then

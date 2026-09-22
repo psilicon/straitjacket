@@ -86,8 +86,9 @@ _sj_init() {
   echo "Agents can commit inside the container using the git identity above."
   echo "Push access depends on your token permissions; Straitjacket does not enforce read-only access."
   echo
-  echo "Last step — log in to Claude (persists across rebuilds):"
+  echo "Last step — log in (persists across rebuilds):"
   echo "  claude        # follow the login prompt, then /exit"
+  echo "  grok          # follow the login prompt, then /exit"
 
   return 0
 }

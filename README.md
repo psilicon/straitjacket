@@ -1,12 +1,12 @@
 # straitjacket
 
-Run Claude Code and Codex inside a disposable container, against **any** directory on your host.
+Run Claude Code, Codex, and Grok Build inside a disposable container, against **any** directory on your host.
 Nothing is copied into your projects — one image serves every target directory.
 
 ```bash
 straitjacket up ~/repos       # build + start
 straitjacket shell ~/repos    # you land in /workspaces/repos
-codex                         # or claude
+{claude|codex|grok}           # launch an agent
 ```
 
 `DIR` defaults to the current directory, so day to day it's `cd ~/repos && straitjacket up && straitjacket shell`.
@@ -17,7 +17,8 @@ codex                         # or claude
 
 - **One image, `straitjacket`**, built from the `Dockerfile` here the first time you run `up`
   (or on `rebuild`). Microsoft's Node 22 devcontainer image + Claude Code from its apt
-  repository + Codex from `@openai/codex` on npm + the GitHub CLI from its apt repository.
+  repository + Codex from `@openai/codex` on npm + the GitHub CLI from its apt repository
+  + Grok Build from its official installer at `https://x.ai/cli/install.sh`.
 - **One container per target directory**, named `straitjacket-<dir basename>` so `docker ps`
   reads at a glance. Lookup is by the `straitjacket.workspace=<dir>` label, so the name is
   cosmetic; if two directories share a basename the second gets a short hash suffix.
@@ -33,10 +34,12 @@ codex                         # or claude
 |---|---|---|
 | `straitjacket-<profile>-claude` | `~/.claude-config` | Claude Code login + config |
 | `straitjacket-<profile>-codex` | `~/.codex` | Codex login + config |
+| `straitjacket-<profile>-grok` | `~/.grok` | Grok Build login, config, and sessions |
 | `straitjacket-<profile>-secrets` | `~/.config/straitjacket` | `env` file of raw tokens |
 
 `CLAUDE_CONFIG_DIR` points Claude's *entire* config at the volume, instead of its default split
-between `~/.claude/` and `~/.claude.json`. Logins survive rebuilds. By default, Straitjacket mounts
+between `~/.claude/` and `~/.claude.json`. Grok keeps its login, config, and sessions under
+`~/.grok`, covered by its own volume. Logins survive rebuilds. By default, Straitjacket mounts
 only the selected workspace and its named credential volumes; it does not mount your host
 configuration directories. Mounting your home directory or adding Docker mounts can expose them.
 
@@ -81,8 +84,8 @@ Docker run arguments again when recreating or rebuilding; they are not saved by 
 - Wires `gh auth git-credential` as git's credential helper.
 - Marks all paths safe for git — the mount is host-owned and may contain many repos.
 - Sources the token file from `.bashrc` and `.profile`; the image sets `BASH_ENV` to it as well, so
-  tokens reach interactive, login, **and** non-interactive shells. The last one matters: Codex
-  spawns non-interactive bash.
+  tokens reach interactive, login, **and** non-interactive shells. The last one matters: claude,
+  codex, and grok spawn non-interactive bash.
 
 ## Install
 
@@ -106,6 +109,7 @@ The wrapper resolves symlinks to find its own Dockerfile, so linking it onto `PA
 straitjacket up ~/repos
 straitjacket init ~/repos            # GH token, git identity, Codex login — once per profile
 straitjacket claude ~/repos          # log in to Claude, then /exit
+straitjacket grok ~/repos            # log in to Grok, then /exit
 ```
 
 `init` is also available inside the container as `source straitjacket-init`.
@@ -118,7 +122,7 @@ straitjacket claude ~/repos          # log in to Claude, then /exit
 | `rebuild [DIR] [-- ARGS]` | Refresh the base image and tools, then recreate the selected container; extra `ARGS` pass through to `docker run` |
 | `shell [DIR]` | Interactive login shell |
 | `exec [DIR] -- CMD` | Run a command |
-| `claude` / `codex [DIR] [-- ARGS]` | Launch an agent directly with optional arguments, e.g. `straitjacket codex -- --help` |
+| `claude` / `codex` / `grok [DIR] [-- ARGS]` | Launch an agent directly with optional arguments, e.g. `straitjacket codex -- --help` |
 | `init [DIR]` | One-time token / identity / Codex login setup |
 | `down [DIR]` | Remove the container; image, volumes and logins survive |
 | `list` | Show straitjacket containers and the directories they serve |
@@ -148,7 +152,7 @@ straitjacket claude ~/repos          # log in to Claude, then /exit
 ```text
 straitjacket/
 ├── bin/straitjacket          # the wrapper CLI
-├── Dockerfile                # node:22 + Claude Code (signed apt) + gh (signed apt) + @openai/codex
+├── Dockerfile                # node:22 + Claude Code (signed apt) + gh (signed apt) + @openai/codex + Grok Build (official installer)
 └── scripts/
     ├── postCreate.sh         # → /usr/local/bin/straitjacket-postcreate
     └── init.sh               # → /usr/local/bin/straitjacket-init
