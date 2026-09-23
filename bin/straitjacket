@@ -39,17 +39,18 @@ usage() {
 Commands:
   up [DIR] [-- ARGS...]   Build the image if missing, then create/start the container for DIR
                           (extra ARGS go to `docker run`, e.g. -- --mount type=bind,source=/data,target=/data)
-  rebuild [DIR]           Rebuild the image and recreate the container
+  rebuild [DIR] [-- ARGS...] Refresh the base image and tools, then recreate DIR's container
   shell [DIR]             Interactive login shell in the container
   exec [DIR] -- CMD...    Run CMD in the container
-  claude [DIR]            Launch Claude Code
-  codex [DIR]             Launch Codex
+  claude [DIR] [-- ARGS...] Launch Claude Code with optional agent arguments
+  codex [DIR] [-- ARGS...] Launch Codex with optional agent arguments
   init [DIR]              Run the one-time token / git identity / Codex login setup
   down [DIR]              Stop and remove the container (image, volumes and logins survive)
   list                    List straitjacket containers and the directories they serve
 
 Environment:
   STRAITJACKET_PROFILE    Volume set to use (default: "default")
+  STRAITJACKET_HOME       Checkout containing the Dockerfile (default: this script's parent)
 USAGE
 }
 
@@ -62,11 +63,28 @@ resolve_dir() {
 
 # After a subcommand name: an argument that isn't `--` is the target directory.
 take_dir() {
+  case "${1:-}" in --|"") ;; -*) die "expected DIR or -- before command arguments" ;; esac
   if [ "$#" -gt 0 ] && [ "$1" != "--" ]; then echo "$1"; else echo ""; fi
 }
 
+only_dir() {
+  local dir
+  dir="$(take_dir "$@")" || return
+  [ -z "$dir" ] || shift
+  [ "$#" -eq 0 ] || die "unexpected arguments to $cmd"
+  resolve_dir "$dir"
+}
+
 workspace()    { echo "/workspaces/$(basename "$1")"; }     # mount point inside the container
-container_id() { docker ps -aq --filter "label=$LABEL=$1"; } # by label — the source of truth
+container_id() {
+  local cid profile
+  cid="$(docker ps -aq --filter "label=$LABEL=$1")" || return
+  [ -n "$cid" ] || return 0
+  case "$cid" in *$'\n'*) die "multiple containers found for $1; inspect them with docker ps -a" ;; esac
+  profile="$(docker inspect -f '{{index .Config.Labels "straitjacket.profile"}}' "$cid")" || return
+  [ "$profile" = "$STRAITJACKET_PROFILE" ] || die "container for $1 uses profile '$profile', not '$STRAITJACKET_PROFILE'. Use its profile for this command; to change profiles, run down with the old profile, then up with the new one."
+  echo "$cid"
+}
 
 short_hash() {
   if command -v shasum >/dev/null; then printf '%s' "$1" | shasum -a 256 | cut -c1-6
@@ -88,14 +106,43 @@ container_name() {
 
 image_exists() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
 
-build_image() {
-  local args=()
-  # Match the host user's ids on Linux so bind-mounted files come out owned by the user.
-  # macOS translates ownership at the mount, so the image defaults (1000:1000) are fine there.
+build_ids() {
   if [ "$(uname -s)" = "Linux" ]; then
-    args+=(--build-arg "USER_UID=$(id -u)" --build-arg "USER_GID=$(id -g)")
+    printf '%s:%s\n' "$(id -u)" "$(id -g)"
+  else
+    echo '1000:1000'
   fi
-  docker build -t "$IMAGE" ${args[@]+"${args[@]}"} "$SJ_ROOT"
+}
+
+image_fingerprint() {
+  # Hash the build inputs and effective ownership, rather than the checkout path or git HEAD.
+  (
+    cd "$SJ_ROOT" || exit 1
+    build_ids
+    for input in Dockerfile .dockerignore scripts/postCreate.sh scripts/init.sh; do
+      if command -v shasum >/dev/null; then shasum -a 256 "$input" || exit 1
+      else sha256sum "$input" || exit 1; fi
+    done
+  ) | { if command -v shasum >/dev/null; then shasum -a 256; else sha256sum; fi; } | cut -d ' ' -f 1
+}
+
+check_image() {
+  local managed fingerprint expected
+  managed="$(docker image inspect -f '{{index .Config.Labels "straitjacket.managed"}}' "$IMAGE")"
+  fingerprint="$(docker image inspect -f '{{index .Config.Labels "straitjacket.build"}}' "$IMAGE")"
+  expected="$(image_fingerprint)"
+  [ "$managed" = true ] && [ "$fingerprint" = "$expected" ] ||
+    die "image '$IMAGE' is unrecognized or differs from this checkout/user; run: straitjacket rebuild $1"
+}
+
+build_image() {
+  local ids fingerprint args=()
+  ids="$(build_ids)"
+  fingerprint="$(image_fingerprint)"
+  [ "$cmd" != rebuild ] || args+=(--pull --no-cache)
+  docker build -t "$IMAGE" ${args[@]+"${args[@]}"} \
+    --build-arg "USER_UID=${ids%:*}" --build-arg "USER_GID=${ids#*:}" \
+    --label straitjacket.managed=true --label "straitjacket.build=$fingerprint" "$SJ_ROOT"
 }
 
 create_container() {  # create_container DIR [DOCKER_RUN_ARGS...]
@@ -109,6 +156,7 @@ create_container() {  # create_container DIR [DOCKER_RUN_ARGS...]
     --name "$(container_name "$dir")" \
     --label "$LABEL=$dir" \
     --label "straitjacket.profile=$p" \
+    --env "STRAITJACKET_PROFILE=$p" \
     --mount "type=bind,source=$dir,target=$ws" \
     --mount "type=volume,source=straitjacket-$p-claude,target=/home/node/.claude-config" \
     --mount "type=volume,source=straitjacket-$p-codex,target=/home/node/.codex" \
@@ -117,7 +165,14 @@ create_container() {  # create_container DIR [DOCKER_RUN_ARGS...]
     "$@" \
     "$IMAGE" sleep infinity)"
   # Runs once per container, as `node` (with sudo), cwd = the mount. Baked into the image.
-  docker exec --workdir "$ws" "$cid" straitjacket-postcreate
+  if docker exec --workdir "$ws" "$cid" straitjacket-postcreate; then
+    return 0
+  else
+    local status=$?
+    echo "straitjacket: setup failed; removing the new container (credential volumes are preserved)" >&2
+    docker rm -f "$cid" >/dev/null || echo "straitjacket: cleanup failed; remove container $cid manually" >&2
+    return "$status"
+  fi
 }
 
 # docker exec into DIR's container as `node`, cwd = the mount, with a TTY when we have one and
@@ -154,13 +209,16 @@ case "$cmd" in
   up|rebuild)
     dir="$(take_dir "$@")"; [ -n "$dir" ] && shift || true
     dir="$(resolve_dir "$dir")"
-    [ "${1:-}" = "--" ] && shift || true
+    if [ "$#" -gt 0 ]; then
+      [ "$1" = "--" ] || die "Docker arguments must follow --"
+      shift
+    fi
     [ -f "$SJ_ROOT/Dockerfile" ] || die "Dockerfile not found at $SJ_ROOT"
-    if [ "$cmd" = "rebuild" ] || ! image_exists; then build_image; fi
     cid="$(container_id "$dir")"
+    if [ "$cmd" = "rebuild" ] || ! image_exists; then build_image
+    else check_image "$dir"; fi
     if [ "$cmd" = "rebuild" ] && [ -n "$cid" ]; then
-      # shellcheck disable=SC2086
-      docker rm -f $cid >/dev/null; cid=""
+      docker rm -f "$cid" >/dev/null; cid=""
     fi
     if [ -z "$cid" ]; then
       create_container "$dir" "$@"
@@ -174,7 +232,7 @@ case "$cmd" in
     ;;
 
   shell)
-    dir="$(resolve_dir "$(take_dir "$@")")"
+    dir="$(only_dir "$@")"
     dc_exec "$dir" bash -l
     ;;
 
@@ -187,26 +245,31 @@ case "$cmd" in
     ;;
 
   claude|codex)
-    dir="$(resolve_dir "$(take_dir "$@")")"
-    dc_exec "$dir" bash -lc "$cmd"
+    dir="$(take_dir "$@")"; [ -n "$dir" ] && shift || true
+    dir="$(resolve_dir "$dir")"
+    if [ "$#" -gt 0 ]; then
+      [ "$1" = "--" ] || die "agent arguments must follow --"
+      shift
+    fi
+    sh_exec "$dir" "$cmd" "$@"
     ;;
 
   init)
-    dir="$(resolve_dir "$(take_dir "$@")")"
+    dir="$(only_dir "$@")"
     # Sourced so the tokens land in the shell that survives the call; `source` finds it on PATH.
     dc_exec "$dir" bash -lc 'source straitjacket-init'
     ;;
 
   down)
-    dir="$(resolve_dir "$(take_dir "$@")")"
+    dir="$(only_dir "$@")"
     ids="$(container_id "$dir")"
     [ -n "$ids" ] || die "no container found for $dir"
-    # shellcheck disable=SC2086
-    docker rm -f $ids >/dev/null
+    docker rm -f "$ids" >/dev/null
     echo "Removed. Image and volumes (logins, tokens) are untouched."
     ;;
 
   list)
+    [ "$#" -eq 0 ] || die "list takes no arguments"
     docker ps -a \
       --filter "label=$LABEL" \
       --format "table {{.Names}}\t{{.Status}}\t{{.Label \"straitjacket.profile\"}}\t{{.Label \"$LABEL\"}}"
